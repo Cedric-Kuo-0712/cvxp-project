@@ -79,6 +79,8 @@ def solve_placement_cvx(data, assignment, target_die, model_type="qp"):
                 obj_terms.append(weight * (cp.square(x[idx] - ax_val) + cp.square(y[idx] - ay_val)))
             elif model_type == "socp":
                 obj_terms.append(weight * cp.norm(cp.vstack([x[idx] - ax_val, y[idx] - ay_val]), 2))
+            elif model_type == "huber":
+                obj_terms.append(weight * (cp.huber(x[idx] - ax_val, 5.0) + cp.huber(y[idx] - ay_val, 5.0)))
     
     if model_type == "lp":
         # Formulate L1 HPWL using helper variables
@@ -147,6 +149,27 @@ def solve_placement_cvx(data, assignment, target_die, model_type="qp"):
                     
         objective = cp.Minimize(cp.sum(obj_terms))
         
+    elif model_type == "huber":
+        # Minimize sum of Huber distances (delta=5.0)
+        delta = 5.0
+        for net_name, net in data.nets.items():
+            die_pins = [p for p in net.pins if assignment.get(p[0]) == target_die]
+            d = len(die_pins)
+            if d <= 1:
+                continue
+                
+            idxs = [inst_to_idx[p[0]] for p in die_pins]
+            weight = 1.0 / (d - 1)
+            
+            # Cliques expansion
+            for i in range(d):
+                for j in range(i + 1, d):
+                    u_idx = idxs[i]
+                    v_idx = idxs[j]
+                    obj_terms.append(weight * (cp.huber(x[u_idx] - x[v_idx], delta) + cp.huber(y[u_idx] - y[v_idx], delta)))
+                    
+        objective = cp.Minimize(cp.sum(obj_terms))
+        
     # Solve
     prob = cp.Problem(objective, constraints)
     prob.solve(solver=cp.CLARABEL)
@@ -203,7 +226,7 @@ def main():
     print("\n=== Solving Convex Placement Formulations via CVXPY ===")
     
     results = {}
-    models = ["lp", "qp", "socp"]
+    models = ["lp", "qp", "socp", "huber"]
     
     for m in models:
         print(f"  Solving {m.upper()} formulation on Top Die...")
@@ -219,14 +242,15 @@ def main():
         
     print("\n### 凸優化模型對比表格 (Convex Formulations Comparison)")
     print()
-    print("| 指標 (Metrics) | LP (L1 HPWL) | QP (L2-Squared) | SOCP (L2 Euclidean) |")
-    print("|---|---|---|---|")
-    print(f"| **HPWL (L1 Wirelength)** | {results['lp']['hpwl']:.2f} | {results['qp']['hpwl']:.2f} | {results['socp']['hpwl']:.2f} |")
-    print(f"| **Euclidean Wirelength** | {results['lp']['eucl']:.2f} | {results['qp']['eucl']:.2f} | {results['socp']['eucl']:.2f} |")
+    print("| 指標 (Metrics) | LP (L1 HPWL) | QP (L2-Squared) | SOCP (L2 Euclidean) | Huber (Hybrid) |")
+    print("|---|---|---|---|---|")
+    print(f"| **HPWL (L1 Wirelength)** | {results['lp']['hpwl']:.2f} | {results['qp']['hpwl']:.2f} | {results['socp']['hpwl']:.2f} | {results['huber']['hpwl']:.2f} |")
+    print(f"| **Euclidean Wirelength** | {results['lp']['eucl']:.2f} | {results['qp']['eucl']:.2f} | {results['socp']['eucl']:.2f} | {results['huber']['eucl']:.2f} |")
     print()
     
-    # Plot side-by-side comparison using matplotlib
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    # Plot side-by-side comparison using matplotlib in a 2x2 grid
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    axes = axes.flatten()
     llx, lly, urx, ury = data.die_size
     
     for i, m in enumerate(models):
@@ -261,7 +285,7 @@ def main():
         ax.set_aspect('equal')
         ax.grid(True, linestyle=':', alpha=0.5)
         
-    plt.suptitle("3D Placement: LP vs. QP vs. SOCP Exact Solutions Comparison", fontsize=14, fontweight='bold', y=1.02)
+    plt.suptitle("3D Placement: LP vs. QP vs. SOCP vs. Huber Exact Solutions", fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
     image_name = "convex_formulations_comparison.png"
     plt.savefig(image_name, dpi=300, bbox_inches='tight')

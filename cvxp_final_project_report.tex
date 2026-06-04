@@ -14,7 +14,7 @@
 \maketitle
 
 \begin{abstract}
-This report presents the implementation and mathematical analysis of convex optimization techniques applied to the 3D IC placement problem. We develop a 3D placement flow incorporating spectral partitioning, Nesterov accelerated global placement, Discrete Cosine Transform (DCT) Poisson solvers for Neumann boundary conditions, and a Log-Sum-Exp (LSE) differentiable wirelength model. Furthermore, we mathematically analyze and empirically compare LP, QP, and SOCP exact formulations using CVXPY to explain cell collapsing and spreading behaviors. Finally, we formulate row legalization as a convex Quadratic Program and solve it using an $O(n)$ Alternating Direction Method of Multipliers (ADMM) refinement pass. Our optimized placement engine scales efficiently to large testcases and achieves a massive 40\% wirelength reduction.
+This report presents the implementation and mathematical analysis of convex optimization techniques applied to the 3D IC placement problem. We develop a 3D placement flow incorporating spectral partitioning, Nesterov accelerated global placement, Discrete Cosine Transform (DCT) Poisson solvers for Neumann boundary conditions, and a Log-Sum-Exp (LSE) differentiable wirelength model. Furthermore, we mathematically analyze and empirically compare LP, QP, and SOCP exact formulations using CVXPY to explain cell collapsing and spreading behaviors. Finally, we formulate row legalization as a convex Quadratic Program and solve it using an $O(n)$ Alternating Direction Method of Multipliers (ADMM) refinement pass. Our optimized placement engine scales efficiently to large testcases and achieves a massive 40\% wirelength reduction comparing to greedy row legalization.
 \end{abstract}
 
 \section{Introduction}
@@ -36,6 +36,21 @@ where $L = D - W$ is the Graph Laplacian matrix. By relaxing the discrete constr
 \min_{s} s^T L s \quad \text{s.t. } s^T s = N, \ s^T \mathbf{1} = 0
 \end{equation}
 By the Rayleigh Quotient theorem, the optimal solution is the eigenvector corresponding to the second smallest eigenvalue of $L$ (known as the Fiedler vector). We compute this vector using SciPy's sparse solver `eigsh` and sort it to divide the instances. We enforce utilization limits by finding the optimal split point and applying a greedy refinement.
+
+\subsection{Semidefinite Programming (SDP) Partitioning Relaxation}
+To assign cells to top/bottom dies, we relax the discrete min-cut problem:
+\begin{equation}
+\min_{s} \frac{1}{4} s^T L s \quad \text{s.t. } s \in \{-1, 1\}^N, \ s^T \mathbf{1} = 0
+\end{equation}
+In Section 2.1, we introduced spectral relaxation. Alternatively, we can formulate this as a Semidefinite Program (SDP) by introducing $S = s s^T$:
+\begin{equation}
+\min_{S} \frac{1}{4} \text{Tr}(L S) \quad \text{s.t. } S \succeq 0, \ S_{ii} = 1, \ -B \le \mathbf{1}^T S \mathbf{1} \le B
+\end{equation}
+where $S \succeq 0$ is the positive semidefinite relaxation of the rank-one constraint $S = s s^T$, and $B$ is a balance threshold. After solving for the continuous matrix $S^*$, we round the solution using:
+\begin{enumerate}
+\item \textbf{Eigenvector Rounding}: Computing the sign of the dominant eigenvector of $S^*$.
+\item \textbf{Goemans-Williamson Randomized Rounding}: Drawing a random vector $r \sim N(0, I)$ and setting $s = \text{sign}(S^{1/2} r)$, which guarantees a high-quality partition.
+\end{enumerate}
 
 \subsection{Analytical Global Placement Formulation}
 Global placement is modeled as a multi-objective optimization problem:
@@ -84,8 +99,8 @@ where $\epsilon = 10^{-5}$ is a ridge-regression regularization factor.
 
 Furthermore, we study the Pareto frontier of HPWL vs. Terminal Count by sweeping the partition ratio $r$. As proved in Lecture 05, the local slope of this frontier $\frac{d W}{d N_{\text{term}}}$ corresponds to the optimal Lagrange multiplier $\lambda^*$, representing the marginal wirelength gain of allowing an extra crossing connection.
 
-\subsection{LP, QP, and SOCP Convex Formulations}
-Using CVXPY and the Clarabel solver, we formulate and compare the exact global placement under three convex metrics:
+\subsection{LP, QP, SOCP, and Huber Convex Formulations}
+Using CVXPY and the Clarabel solver, we formulate and compare the exact global placement under four convex metrics:
 \begin{enumerate}
 \item \textbf{Linear Program (LP)}: Minimizes the L1 Manhattan distance:
 \begin{equation}
@@ -96,6 +111,15 @@ Using CVXPY and the Clarabel solver, we formulate and compare the exact global p
 \begin{equation}
 \min \sum_{e} t_e \quad \text{s.t. } \sqrt{(x_i - x_j)^2 + (y_i - y_j)^2} \le t_e
 \end{equation}
+\item \textbf{Huber Loss (Hybrid L1-L2)}: Minimizes a smooth hybrid of absolute and squared differences:
+\begin{equation}
+\min \sum_{e} \frac{1}{d-1} \sum_{i, j \in e} \left( H_{\delta}(x_i - x_j) + H_{\delta}(y_i - y_j) \right)
+\end{equation}
+where the Huber penalty function $H_{\delta}(a)$ is defined as:
+\begin{equation}
+H_{\delta}(a) = \begin{cases} \frac{1}{2} a^2 & \text{if } |a| \le \delta \\ \delta(|a| - \frac{1}{2} \delta) & \text{if } |a| > \delta \end{cases}
+\end{equation}
+Here, $\delta$ acts as the threshold between quadratic penalization for small wirelengths and linear penalization for long-distance wire connections.
 \end{enumerate}
 
 \subsection{ADMM-based Row Legalization}
@@ -112,6 +136,16 @@ where $D \in \mathbb{R}^{(n+1) \times n}$ encodes boundaries and cell spacing $x
 \item $u$-update: Update the dual variables: $u^{k+1} = u^k + D x^{k+1} - z^{k+1} - w$.
 \end{enumerate}
 This ADMM solver converges quickly and guarantees local 1D optimality on each row.
+
+To understand the sensitivity of the layout to these constraints, we analyze the KKT conditions of the row legalization QP. The Lagrangian of the problem is:
+\begin{equation}
+L(x, \lambda) = \frac{1}{2} \|x - x^*\|_2^2 - \lambda^T (D x - w)
+\end{equation}
+where $\lambda \ge 0$ is the vector of Lagrange multipliers. The stationarity condition with respect to $x$ yields:
+\begin{equation}
+x_{opt} = x^* + D^T \lambda^*
+\end{equation}
+This reveals that the legalized cell coordinates $x_{opt}$ are exactly the global coordinates $x^*$ perturbed by the contact force $D^T \lambda^*$. The dual variables $\lambda_i^*$ represent the "legalization pressure" between cell $i$ and cell $i+1$. Under complementary slackness, we have $\lambda_i^* (x_{i+1} - x_i - w_i) = 0$. Therefore, if two cells are separated ($x_{i+1} - x_i > w_i$), the legalization pressure is exactly zero ($\lambda_i^* = 0$). If they are touching ($x_{i+1} - x_i = w_i$), the pressure $\lambda_i^* \ge 0$ represents the marginal cost (sensitivity) of displacement energy with respect to cell spacing, providing a direct mathematical indicator of local congestion.
 
 \section{Experiments and Results}
 
@@ -204,17 +238,108 @@ Figure~\ref{fig:layout_case1} shows the visual layout of Case 1 after successful
 \label{fig:layout_case1}
 \end{figure*}
 
-\subsection{LP vs. QP vs. SOCP Exact Layout Behavior}
-We solve the exact LP, QP, and SOCP formulations using CVXPY on a small testbench. As shown in Figure~\ref{fig:convex_comp}, LP and SOCP cause cells to collapse into a single point. This is because their gradients are constant, making unanchored cells pull together until they overlap completely. In contrast, QP's gradient decreases linearly as cells approach, allowing them to spread naturally across the die.
+\subsection{LP vs. QP vs. SOCP vs. Huber Exact Layout Behavior}
+We solve the exact LP, QP, SOCP, and Huber formulations using CVXPY on a small testbench. As shown in Figure~\ref{fig:convex_comp}, LP and SOCP cause cells to collapse. This is because their gradients are constant, making cells pull together until they overlap completely unless restricted by boundary or anchor constraints. In contrast, QP behaves like a spring system. Under boundary anchors or fixed pins, the quadratic objective produces smoother interpolation and less degenerate clustering than LP/SOCP in this testcase. However, QP alone still does not guarantee non-overlap or true density spreading.
+
+The Huber loss acts as a smooth hybrid, transitioning from quadratic (L2) behavior for small coordinate differences ($|a| \le \delta$) to linear (L1) behavior for large differences ($|a| > \delta$). This allows it to model HPWL wirelength more closely than quadratic models while retaining a smooth gradient that avoids the non-differentiability of the L1 norm at zero.
+
+The exact numerical results of the formulations on the testbench are detailed in Table~\ref{tab:convex_formulations}.
+
+\begin{table}[htbp]
+\centering
+\caption{Convex Placement Formulations Comparison}
+\label{tab:convex_formulations}
+\begin{tabular}{lcc}
+\toprule
+Formulation & HPWL (L1 Wirelength) & Euclidean (L2) \\
+\midrule
+LP (L1 HPWL) & 84.95 & 65.81 \\
+QP (L2-squared) & 75.14 & 58.11 \\
+SOCP (L2 Euclidean) & 85.75 & 65.68 \\
+Huber (Hybrid, $\delta=5.0$) & 81.51 & 62.26 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Interestingly, QP achieves the lowest wirelength on this small testcase. This counter-intuitive behavior occurs because the virtual corner anchors pull the cells toward the die boundaries. In the LP and SOCP models, the constant gradient results in cells clustering tightly at the anchors or boundaries. In contrast, the quadratic objective in QP exerts stronger forces on cells far from their targets, dragging the cluster closer together and reducing the overall HPWL under the anchor constraints. The Huber loss balances these forces, yielding intermediate wirelength values.
 
 \begin{figure*}[htbp]
 \centering
 \includegraphics[width=0.85\linewidth]{convex_formulations_comparison.png}
-\caption{Exact cell layout comparison: LP, QP, and SOCP.}
+\caption{Exact cell layout comparison: LP, QP, SOCP, and Huber models.}
 \label{fig:convex_comp}
 \end{figure*}
 
-\section{Conclusion}
+\subsection{Dual Legalization Pressure and Sensitivity Analysis}
+To validate the physical and mathematical interpretations of the dual row legalization problem, we set up a 1D legalization scenario with 8 cells on a row of length 50. The cells have widths $w = [4, 6, 5, 8, 4, 6, 5, 4]$ and target (global placement) coordinates $x^* = [5.0, 6.0, 7.0, 22.0, 35.0, 36.0, 37.0, 38.0]$, which exhibit severe overlaps.
+
+We formulate the QP as described in Section 2.5 and solve it to extract the optimal positions $x_{opt}$ and the Lagrange multipliers $\lambda^*$. Figure~\ref{fig:dual_pressure} shows the pre-legalization layout, the legalized layout, and the resulting dual variables.
+
+\begin{figure*}[htbp]
+\centering
+\includegraphics[width=0.85\linewidth]{dual_pressure_analysis.png}
+\caption{Row legalization dual pressure analysis. Top: Pre-legalization overlaps. Middle: Post-legalization positions. Bottom: Dual variables $\lambda_i^*$ at each boundary representing contact pressure.}
+\label{fig:dual_pressure}
+\end{figure*}
+
+The experimental results demonstrate:
+\begin{enumerate}
+\item \textbf{Complementary Slackness Validation}: The gap between Cell 2 and Cell 3 in the post-legalized solution is $5.07 > 0$. The corresponding Lagrange multiplier is exactly $\lambda_2^* = 0.0000$. This matches the complementary slackness requirement: since the constraint is inactive, the legalization pressure is zero.
+\item \textbf{Squeezing Pressure Mapping}: All other adjacent cell constraints are active (gap = 0.0). Their dual variables are strictly positive, peaking at $\lambda_5^* = 8.80$ at the boundary between Cell 5 and Cell 6. This indicates high localized congestion in that region.
+\item \textbf{Feedback for Placers}: The dual variables $\lambda_i^*$ serve as a direct mathematical sensitivity metric. A high $\lambda^*$ indicates that moving the cell boundary slightly would significantly reduce the displacement energy. This pressure signal can be fed back to the global placer to dynamically inflate cell areas in congested rows or trigger cell migrations.
+\end{enumerate}
+
+To study the practical trade-off between cell displacement and legalization feasibility, we sweep the maximum displacement constraint $D_{\max}$ (Infinity-norm). The results are summarized in Table~\ref{tab:dmax_sweep}.
+
+\begin{table}[htbp]
+\centering
+\caption{Displacement Cost vs. $D_{\max}$ Constraint}
+\label{tab:dmax_sweep}
+\begin{tabular}{ccc}
+\toprule
+$D_{\max}$ & Status & Primal Displacement Cost \\
+\midrule
+1.0--5.0 & Infeasible & --- \\
+6.0 & Optimal & 59.33 \\
+7.0 & Optimal & 58.93 \\
+8.0 & Optimal & 58.93 \\
+10.0 & Optimal & 58.93 \\
+$\infty$ & Optimal & 58.93 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+As shown in Figure~\ref{fig:dmax_sweep}, for very tight displacement bounds ($D_{\max} \le 5.0$), the cell spacing requirements cannot be resolved, making the optimization infeasible. At $D_{\max} = 6.0$, the problem becomes feasible at the expense of a slightly higher displacement cost ($59.33$ vs. the unconstrained $58.93$). For $D_{\max} \ge 6.4$, the displacement constraint becomes inactive, and the cost plateaus at the global minimum. This illustrates a clear engineering trade-off between layout compliance and feasibility.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.85\linewidth]{displacement_vs_dmax.png}
+\caption{Legalization displacement cost trade-off with maximum displacement constraint $D_{\max}$.}
+\label{fig:dmax_sweep}
+\end{figure}
+
+\subsection{Semidefinite Programming (SDP) Partitioning Comparison}
+We solve the Semidefinite Programming (SDP) relaxation of the min-cut partitioning problem on the Case 1 netlist and compare it against the spectral partitioning (Fiedler vector) method. Both solvers successfully partition the 8-cell netlist by cutting only Net 2, achieving the optimal cut size of 1.00. 
+
+The SDP relaxation lower bound is $0.9318$, which is remarkably close to the integer optimal value of $1.00$. This confirms the tightness of the semidefinite relaxation. Eigenvector rounding and Goemans-Williamson randomized rounding both yield the identical optimal partition:
+\begin{itemize}
+\item \textbf{Top Die}: C3, C4, C5, C6, C7 (Total Area = 828.0)
+\item \textbf{Bottom Die}: C1, C2, C8 (Total Area = 344.0)
+\end{itemize}
+Although the 0.878 approximation guarantee is classically associated with the Goemans-Williamson SDP for Max-Cut, our use of SDP here should be interpreted primarily as a convex relaxation that provides a rigorous lower bound for the balanced min-cut objective. The randomized rounding procedure is used as a heuristic for recovering a discrete partition.
+
+\section{Conclusion and Limitation}
+\subsection{Conclusion}
 This work implemented and evaluated several convex optimization methods for 3D placement. By utilizing Nesterov acceleration, Poisson solvers, stabilized LSE models, and ADMM row optimization, our placer is robust, scalable, and mathematically optimal. Our CVXPY study highlighted why QP is uniquely suited for cell spreading, and our ADMM legalization pass demonstrated a massive 40\% reduction in final wirelength.
+
+\subsection{Limitation}
+\begin{itemize}
+    \item The full 3D placement problem is not globally convex.
+    \item Spectral and SDP formulations are relaxations of the discrete partitioning problem.
+    \item Huber, LP, QP, and SOCP wirelength models alone do not enforce non-overlap.
+    \item DCT Neumann boundary improves boundary behavior but does not replace explicit boundary constraints.
+    \item ADMM legalization guarantees optimality only for fixed row assignments in 1D, not for full 2D placement.
+    \item SDP is useful for small-scale theoretical analysis but not scalable to large industrial cases.
+\end{itemize}
 
 \end{document}
