@@ -3,7 +3,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from parser import parse_input
 
-def spectral_partition(data):
+def spectral_partition(data, target_top_ratio=None):
     """
     Perform spectral partitioning on the parsed netlist to assign instances to top and bottom dies.
     Returns:
@@ -94,7 +94,9 @@ def spectral_partition(data):
     try:
         # We ask for k=2 eigenvalues. Fiedler vector is eigenvectors[:, 1] (or [:, 0] depending on order)
         # We need a stable solver.
-        val, vec = spla.eigsh(L.astype(float), k=min(n - 1, 2), which='SM')
+        # Use a deterministic starting vector v0 for repeatability
+        v0 = np.sin(np.arange(n) + 1.0)
+        val, vec = spla.eigsh(L.astype(float), k=min(n - 1, 2), which='SM', v0=v0)
         # Sort eigenvalues to be sure
         idx_sort = np.argsort(val)
         val = val[idx_sort]
@@ -131,65 +133,107 @@ def spectral_partition(data):
     best_assignment = None
     min_violation = float('inf')
     
-    # Try all possible split points
-    # Since n can be large, we can sample split points or do binary search,
-    # but for small/medium cases we can scan.
-    # To be efficient, we can precalculate cumulative sums.
-    
-    # Let's compute prefix sums of areas
-    # bottom_area if sorted_indices[0..i] are bottom, and remaining are top
     areas_bottom_sorted = inst_areas_bottom[sorted_indices]
     areas_top_sorted = inst_areas_top[sorted_indices]
     
-    pref_bottom = np.cumsum(areas_bottom_sorted)
-    # suffix sum of top area
-    suff_top = np.cumsum(areas_top_sorted[::-1])[::-1]
-    
-    for p in range(0, n + 1):
-        # p is the number of elements in the bottom die
-        if p == 0:
-            area_b = 0
-            area_t = suff_top[0]
-        elif p == n:
-            area_b = pref_bottom[-1]
-            area_t = 0
-        else:
-            area_b = pref_bottom[p-1]
-            area_t = suff_top[p]
-            
-        violation_b = max(0.0, area_b - max_area_bottom)
-        violation_t = max(0.0, area_t - max_area_top)
-        total_violation = violation_b + violation_t
+    if target_top_ratio is None:
+        # Original logic exactly to preserve baseline behavior
+        pref_bottom = np.cumsum(areas_bottom_sorted)
+        suff_top = np.cumsum(areas_top_sorted[::-1])[::-1]
         
-        if total_violation < min_violation:
-            min_violation = total_violation
-            best_p = p
-            best_assignment = 'bottom_first'  # [0..p-1] is bottom, [p..n-1] is top
+        for p in range(0, n + 1):
+            if p == 0:
+                area_b = 0
+                area_t = suff_top[0]
+            elif p == n:
+                area_b = pref_bottom[-1]
+                area_t = 0
+            else:
+                area_b = pref_bottom[p-1]
+                area_t = suff_top[p]
+                
+            violation_b = max(0.0, area_b - max_area_bottom)
+            violation_t = max(0.0, area_t - max_area_top)
+            total_violation = violation_b + violation_t
             
-    # Also try the opposite assignment (just in case)
-    # [0..p-1] is top, [p..n-1] is bottom
-    pref_top = np.cumsum(areas_top_sorted)
-    suff_bottom = np.cumsum(areas_bottom_sorted[::-1])[::-1]
-    
-    for p in range(0, n + 1):
-        if p == 0:
-            area_t = 0
-            area_b = suff_bottom[0]
-        elif p == n:
-            area_t = pref_top[-1]
-            area_b = 0
-        else:
-            area_t = pref_top[p-1]
-            area_b = suff_bottom[p]
-            
-        violation_b = max(0.0, area_b - max_area_bottom)
-        violation_t = max(0.0, area_t - max_area_top)
-        total_violation = violation_b + violation_t
+            if total_violation < min_violation:
+                min_violation = total_violation
+                best_p = p
+                best_assignment = 'bottom_first'
+                
+        pref_top = np.cumsum(areas_top_sorted)
+        suff_bottom = np.cumsum(areas_bottom_sorted[::-1])[::-1]
         
-        if total_violation < min_violation:
-            min_violation = total_violation
-            best_p = p
-            best_assignment = 'top_first'  # [0..p-1] is top, [p..n-1] is bottom
+        for p in range(0, n + 1):
+            if p == 0:
+                area_t = 0
+                area_b = suff_bottom[0]
+            elif p == n:
+                area_t = pref_top[-1]
+                area_b = 0
+            else:
+                area_t = pref_top[p-1]
+                area_b = suff_bottom[p]
+                
+            violation_b = max(0.0, area_b - max_area_bottom)
+            violation_t = max(0.0, area_t - max_area_top)
+            total_violation = violation_b + violation_t
+            
+            if total_violation < min_violation:
+                min_violation = total_violation
+                best_p = p
+                best_assignment = 'top_first'
+    else:
+        # Lexicographical optimization to target a specific ratio:
+        # 1. Minimize utilization violation
+        # 2. Minimize absolute distance to target_top_ratio
+        total_area_top = np.sum(areas_top_sorted)
+        target_area_top = total_area_top * target_top_ratio
+        
+        candidates = []
+        
+        # bottom_first
+        pref_bottom = np.cumsum(areas_bottom_sorted)
+        suff_top = np.cumsum(areas_top_sorted[::-1])[::-1]
+        for p in range(0, n + 1):
+            if p == 0:
+                area_b = 0
+                area_t = suff_top[0]
+            elif p == n:
+                area_b = pref_bottom[-1]
+                area_t = 0
+            else:
+                area_b = pref_bottom[p-1]
+                area_t = suff_top[p]
+                
+            violation_b = max(0.0, area_b - max_area_bottom)
+            violation_t = max(0.0, area_t - max_area_top)
+            total_violation = violation_b + violation_t
+            dist = abs(area_t - target_area_top)
+            candidates.append((total_violation, dist, p, 'bottom_first'))
+            
+        # top_first
+        pref_top = np.cumsum(areas_top_sorted)
+        suff_bottom = np.cumsum(areas_bottom_sorted[::-1])[::-1]
+        for p in range(0, n + 1):
+            if p == 0:
+                area_t = 0
+                area_b = suff_bottom[0]
+            elif p == n:
+                area_t = pref_top[-1]
+                area_b = 0
+            else:
+                area_t = pref_top[p-1]
+                area_b = suff_bottom[p]
+                
+            violation_b = max(0.0, area_b - max_area_bottom)
+            violation_t = max(0.0, area_t - max_area_top)
+            total_violation = violation_b + violation_t
+            dist = abs(area_t - target_area_top)
+            candidates.append((total_violation, dist, p, 'top_first'))
+            
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        min_violation, _, best_p, best_assignment = candidates[0]
 
     # Build the final assignment dict
     assignment = {}

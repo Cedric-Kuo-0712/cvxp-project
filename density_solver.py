@@ -137,6 +137,49 @@ class DensityGrid:
         
         return Ex, Ey, potential_energy
 
+    def solve_poisson_dct(self, rho, target_density):
+        """
+        Solve Poisson equation using 2D DCT under Neumann boundary conditions:
+            \nabla^2 \phi = \rho - \rho_target
+        Returns:
+            Ex: electric field x component, 2D array (nx, ny)
+            Ey: electric field y component, 2D array (nx, ny)
+            potential_energy: scalar sum of phi * (rho - rho_target)
+        """
+        from scipy.fft import dctn, idctn
+        
+        # Define charge density distribution
+        q = rho - target_density
+        
+        # 2D DCT of charge density
+        q_hat = dctn(q, type=2, norm='ortho')
+        
+        # Cosine eigenvalues for Neumann BC
+        u = np.arange(self.nx)[:, None]
+        v = np.arange(self.ny)[None, :]
+        denom = 2.0 * (1.0 - np.cos(np.pi * u / self.nx)) + 2.0 * (1.0 - np.cos(np.pi * v / self.ny))
+        denom[0, 0] = 1.0
+        
+        # Solve for potential in frequency domain
+        phi_hat = q_hat / denom
+        phi_hat[0, 0] = 0.0 # DC component has 0 potential
+        
+        # Inverse DCT to get spatial potential
+        phi = idctn(phi_hat, type=2, norm='ortho')
+        
+        # Compute electric field (repulsive force) using spatial central differences.
+        # Boundary values are 0 to satisfy Neumann boundary condition.
+        Ex = np.zeros_like(phi)
+        Ex[1:-1, :] = (phi[2:, :] - phi[:-2, :]) / 2.0
+        
+        Ey = np.zeros_like(phi)
+        Ey[:, 1:-1] = (phi[:, 2:] - phi[:, :-2]) / 2.0
+        
+        # Potential energy: 0.5 * sum(q * phi)
+        potential_energy = 0.5 * np.sum(q * phi)
+        
+        return Ex, Ey, potential_energy
+
     def compute_density_forces(self, positions, sizes, Ex, Ey):
         """
         Compute repulsive forces on each cell by interpolation from the electric field.

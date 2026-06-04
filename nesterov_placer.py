@@ -1,11 +1,57 @@
 import numpy as np
+# pyrefly: ignore [missing-import]
 import scipy.sparse as sp
 from parser import parse_input
 from partitioner import spectral_partition
 from qp_solver import construct_laplacian, run_irls_qp
 from density_solver import DensityGrid
 
-def run_nesterov_placer(data, assignment, target_die, num_iterations=100, lr=0.1, init_lambda=0.01):
+def compute_lse_gradient(data, assignment, target_die, x, y, inst_names, inst_to_idx, gamma=0.5):
+    """
+    Compute the gradient of the Log-Sum-Exp (LSE) smooth HPWL model.
+    Using the max-subtraction stabilization trick to prevent float overflow.
+    """
+    n = len(inst_names)
+    grad_wx = np.zeros(n)
+    grad_wy = np.zeros(n)
+    
+    for net_name, net in data.nets.items():
+        die_pins = [p for p in net.pins if assignment.get(p[0]) == target_die]
+        if len(die_pins) <= 1:
+            continue
+            
+        idxs = [inst_to_idx[p[0]] for p in die_pins]
+        
+        # X-gradient
+        xs = x[idxs]
+        xmax = np.max(xs)
+        xmin = np.min(xs)
+        
+        exp_pos = np.exp(gamma * (xs - xmax))
+        exp_neg = np.exp(-gamma * (xs - xmin))
+        
+        sum_pos = np.sum(exp_pos)
+        sum_neg = np.sum(exp_neg)
+        
+        # Y-gradient
+        ys = y[idxs]
+        ymax = np.max(ys)
+        ymin = np.min(ys)
+        
+        exp_pos_y = np.exp(gamma * (ys - ymax))
+        exp_neg_y = np.exp(-gamma * (ys - ymin))
+        
+        sum_pos_y = np.sum(exp_pos_y)
+        sum_neg_y = np.sum(exp_neg_y)
+        
+        # Accumulate pin gradients
+        for i, idx in enumerate(idxs):
+            grad_wx[idx] += (exp_pos[i] / sum_pos - exp_neg[i] / sum_neg)
+            grad_wy[idx] += (exp_pos_y[i] / sum_pos_y - exp_neg_y[i] / sum_neg_y)
+            
+    return grad_wx, grad_wy
+
+def run_nesterov_placer(data, assignment, target_die, num_iterations=100, lr=0.1, init_lambda=0.01, density_solver='fft', check_kkt=False, wirelength_model='quadratic', gamma=0.5):
     """
     Run Nesterov Accelerated Gradient (NAG) global placement on a single die.
     Minimizes: f(x, y) = W_HPWL(x, y) + lambda * Potential_Energy(x, y)
@@ -36,7 +82,7 @@ def run_nesterov_placer(data, assignment, target_die, num_iterations=100, lr=0.1
     height = ury - lly
     center_x = (llx + urx) / 2.0
     center_y = (lly + ury) / 2.0
-    qp_positions = run_irls_qp(data, assignment, target_die, num_iterations=3, center_x=center_x, center_y=center_y)
+    qp_positions = run_irls_qp(data, assignment, target_die, num_iterations=3, center_x=center_x, center_y=center_y, check_kkt=check_kkt)
     
     x = np.array([qp_positions[name][0] for name in inst_names])
     y = np.array([qp_positions[name][1] for name in inst_names])
@@ -79,14 +125,20 @@ def run_nesterov_placer(data, assignment, target_die, num_iterations=100, lr=0.1
         yx = np.clip(yx, llx, urx)
         yy = np.clip(yy, lly, ury)
         
-        # 2. Compute wirelength gradient: grad_w = L * y_coord
-        grad_wx = L.dot(yx)
-        grad_wy = L.dot(yy)
+        # 2. Compute wirelength gradient: grad_w
+        if wirelength_model == 'lse':
+            grad_wx, grad_wy = compute_lse_gradient(data, assignment, target_die, yx, yy, inst_names, inst_to_idx, gamma)
+        else:
+            grad_wx = L.dot(yx)
+            grad_wy = L.dot(yy)
         
         # 3. Compute density gradient (forces)
         curr_positions = {inst_names[i]: (yx[i], yy[i]) for i in range(n)}
         rho = grid.compute_density_map(curr_positions, sizes)
-        Ex, Ey, pot = grid.solve_poisson_fft(rho, target_density)
+        if density_solver == 'dct':
+            Ex, Ey, pot = grid.solve_poisson_dct(rho, target_density)
+        else:
+            Ex, Ey, pot = grid.solve_poisson_fft(rho, target_density)
         forces = grid.compute_density_forces(curr_positions, sizes, Ex, Ey)
         
         grad_dx = np.array([-forces[name][0] for name in inst_names])

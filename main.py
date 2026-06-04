@@ -1,5 +1,6 @@
 import sys
 import os
+import argparse
 import numpy as np
 from parser import parse_input
 from partitioner import spectral_partition
@@ -62,12 +63,19 @@ def calculate_hpwl_3d(data, assignment, cell_positions, terminals):
     return total_hpwl
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: python3 main.py <input_file> <output_file>")
-        sys.exit(1)
-        
-    input_file = sys.argv[1]
-    output_file = sys.argv[2]
+    parser = argparse.ArgumentParser(description="3D IC Placement Engine")
+    parser.add_argument("input_file", type=str, help="Input netlist file")
+    parser.add_argument("output_file", type=str, help="Output placement file")
+    parser.add_argument("--density-solver", type=str, choices=["fft", "dct"], default="fft", help="Poisson solver type (default: fft)")
+    parser.add_argument("--check-kkt", action="store_true", help="Enable explicit KKT conditions check for QPs")
+    parser.add_argument("--target-top-ratio", type=float, default=None, help="Target ratio of instances/area on top die")
+    parser.add_argument("--wirelength-model", type=str, choices=["quadratic", "lse"], default="quadratic", help="Wirelength model type (default: quadratic)")
+    parser.add_argument("--gamma", type=float, default=0.5, help="Smoothing parameter for LSE model (default: 0.5)")
+    parser.add_argument("--use-admm", action="store_true", help="Enable ADMM-based legalization refinement pass")
+    args = parser.parse_args()
+    
+    input_file = args.input_file
+    output_file = args.output_file
     
     if not os.path.exists(input_file):
         print(f"Error: Input file {input_file} not found.")
@@ -84,7 +92,7 @@ def main():
     
     # 2. Partition Netlist (Spectral Relaxation)
     print("\n[Step 2] Spectral Partitioning...")
-    assignment = spectral_partition(data)
+    assignment = spectral_partition(data, target_top_ratio=args.target_top_ratio)
     
     # 3. Global Placement (Nesterov Accelerated Gradient & Electrostatics)
     print("\n[Step 3] Global Placement (NAG + Electrostatics)...")
@@ -93,12 +101,14 @@ def main():
     # Run placement for each die
     for die in ['top', 'bottom']:
         print(f"\n--- Running Global Placement for {die.upper()} Die ---")
-        positions_die = run_nesterov_placer(data, assignment, die, num_iterations=50, lr=0.5)
+        positions_die = run_nesterov_placer(data, assignment, die, num_iterations=50, lr=0.5,
+                                            density_solver=args.density_solver, check_kkt=args.check_kkt,
+                                            wirelength_model=args.wirelength_model, gamma=args.gamma)
         gp_positions.update(positions_die)
         
     # 4. Legalize cell positions (Snap to Rows & remove overlaps)
     print("\n[Step 4] Legalizing Cell Positions...")
-    legal_positions = legalize_cells_on_rows(data, assignment, gp_positions)
+    legal_positions = legalize_cells_on_rows(data, assignment, gp_positions, use_admm=args.use_admm)
     
     # 5. Optimize & Legalize Terminals (Median L1 + Grid Matching)
     print("\n[Step 5] Optimizing and Legalizing Terminals...")

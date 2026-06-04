@@ -1,5 +1,70 @@
 import numpy as np
 
+def admm_legalize_row(x_star, widths, llx, urx, rho=1.0, max_iters=200, tol=1e-5):
+    n = len(x_star)
+    if n == 0:
+        return np.array([])
+        
+    x = np.copy(x_star)
+    z = np.zeros(n + 1)
+    u = np.zeros(n + 1)
+    
+    w = np.zeros(n + 1)
+    w[0] = llx
+    for i in range(n - 1):
+        w[i+1] = widths[i]
+    w[n] = -(urx - widths[-1])
+    
+    diag = (1.0 + 2.0 * rho) * np.ones(n)
+    off_diag = -rho * np.ones(n - 1)
+    
+    c_prime = np.zeros(n - 1)
+    if n > 1:
+        c_prime[0] = off_diag[0] / diag[0]
+        for i in range(1, n - 1):
+            c_prime[i] = off_diag[i] / (diag[i] - off_diag[i-1] * c_prime[i-1])
+        
+    for k in range(max_iters):
+        v = z + w - u
+        dT_v = np.zeros(n)
+        for i in range(n):
+            dT_v[i] = v[i] - v[i+1]
+            
+        rhs = x_star + rho * dT_v
+        
+        # Thomas algorithm
+        d_prime = np.zeros(n)
+        d_prime[0] = rhs[0] / diag[0]
+        for i in range(1, n):
+            denom = diag[i] - off_diag[i-1] * c_prime[i-1]
+            d_prime[i] = (rhs[i] - off_diag[i-1] * d_prime[i-1]) / denom
+            
+        x_new = np.zeros(n)
+        x_new[-1] = d_prime[-1]
+        for i in range(n - 2, -1, -1):
+            x_new[i] = d_prime[i] - c_prime[i] * x_new[i+1]
+            
+        dx = np.zeros(n + 1)
+        dx[0] = x_new[0]
+        for i in range(n - 1):
+            dx[i+1] = x_new[i+1] - x_new[i]
+        dx[n] = -x_new[-1]
+        
+        z_new = np.maximum(0.0, dx - w + u)
+        u_new = u + dx - z_new - w
+        
+        primal_res = np.linalg.norm(dx - z_new - w)
+        dual_res = np.linalg.norm(rho * (z_new - z))
+        
+        x = x_new
+        z = z_new
+        u = u_new
+        
+        if primal_res < tol and dual_res < tol:
+            break
+            
+    return x
+
 def optimize_and_legalize_terminals(data, assignment, cell_positions):
     """
     1. Identify crossing nets.
@@ -246,7 +311,7 @@ def resolve_macro_overlaps(macros, sizes, positions, die_size):
         return placed
 
 
-def legalize_cells_on_rows(data, assignment, cell_positions):
+def legalize_cells_on_rows(data, assignment, cell_positions, use_admm=False):
     """
     Snaps standard cells to rows and resolves overlaps.
     Resolves macro overlaps first, then standard cells avoid macros.
@@ -254,6 +319,8 @@ def legalize_cells_on_rows(data, assignment, cell_positions):
     """
     legalized_positions = {}
     llx, lly, urx, ury = data.die_size
+    
+    sizes = {}
     
     # Process top and bottom dies separately
     for die in ['top', 'bottom']:
@@ -267,7 +334,6 @@ def legalize_cells_on_rows(data, assignment, cell_positions):
         # Split into macros and standard cells
         macros = []
         std_cells = []
-        sizes = {}
         for name in die_insts:
             inst = data.instances[name]
             lc = tech.lib_cells[inst.lib_cell_name]
@@ -346,37 +412,30 @@ def legalize_cells_on_rows(data, assignment, cell_positions):
                 # Check closest tx
                 tx_init = int(np.clip(np.round(cx), llx, urx - cell_w))
                 
-                def is_valid_pos(x):
-                    for start, end in merged_blocks:
-                        if max(x, start) < min(x + cell_w, end):
-                            return False
-                    return True
-                    
-                if is_valid_pos(tx_init):
-                    best_tx = tx_init
+                gaps = []
+                if not merged_blocks:
+                    gaps.append((llx, urx))
+                else:
+                    if llx < merged_blocks[0][0]:
+                        gaps.append((llx, merged_blocks[0][0]))
+                    for i in range(len(merged_blocks) - 1):
+                        if merged_blocks[i][1] < merged_blocks[i+1][0]:
+                            gaps.append((merged_blocks[i][1], merged_blocks[i+1][0]))
+                    if merged_blocks[-1][1] < urx:
+                        gaps.append((merged_blocks[-1][1], urx))
+                
+                valid_candidates = []
+                for g_start, g_end in gaps:
+                    if g_end - g_start >= cell_w:
+                        cand_x = max(g_start, min(tx_init, g_end - cell_w))
+                        dist = abs(cand_x - tx_init)
+                        valid_candidates.append((cand_x, dist))
+                
+                if valid_candidates:
+                    best_cand_x, best_dist = min(valid_candidates, key=lambda item: item[1])
+                    best_tx = best_cand_x
                     best_ry = ry
                     break
-                else:
-                    # Search outwards
-                    found_on_row = False
-                    max_offset = urx - llx
-                    for offset in range(1, max_offset):
-                        # Check right
-                        r_tx = tx_init + offset
-                        if r_tx <= urx - cell_w and is_valid_pos(r_tx):
-                            best_tx = r_tx
-                            best_ry = ry
-                            found_on_row = True
-                            break
-                        # Check left
-                        l_tx = tx_init - offset
-                        if l_tx >= llx and is_valid_pos(l_tx):
-                            best_tx = l_tx
-                            best_ry = ry
-                            found_on_row = True
-                            break
-                    if found_on_row:
-                        break
                         
             # Fallback if it does not fit anywhere without overlap
             if best_tx is None:
@@ -385,7 +444,90 @@ def legalize_cells_on_rows(data, assignment, cell_positions):
                 
             legalized_positions[sc_name] = (best_tx, int(best_ry))
             placed_std_on_row[best_ry].append(sc_name)
+    # 3. Optional ADMM-based Legalization Refinement Pass
+    if use_admm:
+        print("  [ADMM Legalizer] Running ADMM optimization pass on standard cells...")
+        for die in ['top', 'bottom']:
+            die_insts = [name for name, d in assignment.items() if d == die]
+            if not die_insts:
+                continue
+            tech_name = data.top_die_tech if die == 'top' else data.bottom_die_tech
+            tech = data.technologies[tech_name]
             
+            # Reconstruct list of rows and heights
+            rows = data.top_die_rows if die == 'top' else data.bottom_die_rows
+            row_ys = []
+            row_heights = {}
+            for r in rows:
+                for r_idx in range(r.repeat_count):
+                    ry = r.start_y + r_idx * r.row_height
+                    row_ys.append(ry)
+                    row_heights[ry] = r.row_height
+            row_ys = sorted(list(set(row_ys)))
+            
+            # Reconstruct macro blocked intervals for each row Y
+            legalized_macros = {name: pos for name, pos in legalized_positions.items() if name in die_insts and tech.lib_cells[data.instances[name].lib_cell_name].is_macro == 'Y'}
+            row_blocks = {ry: [] for ry in row_ys}
+            for m_name, (mx, my) in legalized_macros.items():
+                mw, mh = sizes[m_name]
+                for ry in row_ys:
+                    r_h = row_heights[ry]
+                    if max(ry, my) < min(ry + r_h, my + mh):
+                        row_blocks[ry].append((mx, mx + mw))
+            for ry in row_ys:
+                row_blocks[ry] = sorted(row_blocks[ry])
+                
+            # For each row, group standard cells placed on that row into gaps
+            for ry in row_ys:
+                gaps = []
+                blocks = row_blocks[ry]
+                if not blocks:
+                    gaps.append((llx, urx))
+                else:
+                    if llx < blocks[0][0]:
+                        gaps.append((llx, blocks[0][0]))
+                    for i in range(len(blocks) - 1):
+                        if blocks[i][1] < blocks[i+1][0]:
+                            gaps.append((blocks[i][1], blocks[i+1][0]))
+                    if blocks[-1][1] < urx:
+                        gaps.append((blocks[-1][1], urx))
+                        
+                row_cells = placed_std_on_row.get(ry, [])
+                if not row_cells:
+                    continue
+                    
+                gap_to_cells = {i: [] for i in range(len(gaps))}
+                for sc_name in row_cells:
+                    gx = legalized_positions[sc_name][0]
+                    best_gap_idx = 0
+                    min_dist = float('inf')
+                    for idx, (g_start, g_end) in enumerate(gaps):
+                        if g_start <= gx <= g_end:
+                            best_gap_idx = idx
+                            break
+                        dist = min(abs(gx - g_start), abs(gx - g_end))
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_gap_idx = idx
+                    gap_to_cells[best_gap_idx].append(sc_name)
+                    
+                for idx, (g_start, g_end) in enumerate(gaps):
+                    gap_cells = gap_to_cells[idx]
+                    if not gap_cells:
+                        continue
+                    # Sort cells by their global coordinates
+                    gap_cells.sort(key=lambda name: cell_positions[name][0])
+                    
+                    x_star = np.array([cell_positions[name][0] for name in gap_cells])
+                    widths = np.array([sizes[name][0] for name in gap_cells])
+                    
+                    # Run ADMM
+                    x_opt = admm_legalize_row(x_star, widths, g_start, g_end)
+                    
+                    # Update legalized positions
+                    for i, sc_name in enumerate(gap_cells):
+                        legalized_positions[sc_name] = (int(np.round(x_opt[i])), int(ry))
+                        
     return legalized_positions
 
 if __name__ == "__main__":

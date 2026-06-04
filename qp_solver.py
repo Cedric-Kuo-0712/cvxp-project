@@ -1,8 +1,10 @@
 import numpy as np
+# pyrefly: ignore [missing-import]
 import scipy.sparse as sp
+# pyrefly: ignore [missing-import]
 import scipy.sparse.linalg as spla
 
-def solve_constrained_qp(L, areas, target_center, epsilon=1e-5):
+def solve_constrained_qp(L, areas, target_center, epsilon=1e-5, check_kkt=False):
     """
     Solve the equality-constrained QP:
         min  1/2 * x^T * L * x
@@ -42,6 +44,21 @@ def solve_constrained_qp(L, areas, target_center, epsilon=1e-5):
     lam = -C / denom
     x = -v * lam
     
+    if check_kkt:
+        primal_feas_val = np.dot(areas, x)
+        primal_residual = abs(primal_feas_val - C)
+        
+        stationarity_vec = L_reg.dot(x) + areas * lam
+        stationarity_residual = np.linalg.norm(stationarity_vec)
+        
+        norm_L_reg_x = np.linalg.norm(L_reg.dot(x))
+        norm_areas_lam = np.linalg.norm(areas * lam)
+        scale = max(1e-9, norm_L_reg_x, norm_areas_lam)
+        rel_stationarity = stationarity_residual / scale
+        
+        print(f"      [KKT Check] Primal Feasibility Residual: {primal_residual:.2e} (C = {C:.2e})")
+        print(f"      [KKT Check] Stationarity Residual: {stationarity_residual:.2e} (Relative: {rel_stationarity:.2e})")
+        
     return x
 
 def construct_laplacian(data, inst_names, inst_to_idx, assignment, target_die, weights=None):
@@ -100,7 +117,7 @@ def construct_laplacian(data, inst_names, inst_to_idx, assignment, target_die, w
     L = D + W  # Since W has negative off-diagonal entries, L = D - (-W) = D + W
     return L
 
-def run_irls_qp(data, assignment, target_die, num_iterations=5, center_x=250.0, center_y=225.0):
+def run_irls_qp(data, assignment, target_die, num_iterations=5, center_x=250.0, center_y=225.0, check_kkt=False):
     """
     Run Iteratively Reweighted Least Squares (IRLS) on a single die.
     Approximates L1 HPWL.
@@ -140,8 +157,8 @@ def run_irls_qp(data, assignment, target_die, num_iterations=5, center_x=250.0, 
         Ly = Lx  # Topology is same, so Ly is same as Lx
         
         # Solve constrained QP
-        x_new = solve_constrained_qp(Lx, areas, center_x)
-        y_new = solve_constrained_qp(Ly, areas, center_y)
+        x_new = solve_constrained_qp(Lx, areas, center_x, check_kkt=check_kkt)
+        y_new = solve_constrained_qp(Ly, areas, center_y, check_kkt=check_kkt)
         
         # Update weights based on current distance (IRLS)
         # For a net, the "span" is max(coord) - min(coord).
